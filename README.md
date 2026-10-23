@@ -39,12 +39,34 @@ Dan komen de stemmen automatisch binnen en kan iedereen de uitslag live volgen. 
            ".read": true,
            "meta": {
              ".write": "!data.exists()",
-             ".validate": "newData.hasChildren(['i', 'f', 't'])"
+             ".validate": "newData.hasChildren(['i', 'f', 't'])",
+             "v": { ".validate": "newData.isNumber()" },
+             "i": { ".validate": "newData.isString() && newData.val().length <= 20" },
+             "n": { ".validate": "newData.isString() && newData.val().length <= 100" },
+             "h": { ".validate": "newData.isString() && newData.val().length <= 60" },
+             "t": { ".validate": "newData.isNumber()" },
+             "p": { ".validate": "newData.isNumber()" },
+             "l": { ".validate": "newData.isNumber()" },
+             "f": {
+               "$n": {
+                 ".validate": "$n.length <= 2 && ((newData.isString() && newData.val().length <= 12) || newData.hasChildren(['0', '1']))",
+                 "0": { ".validate": "newData.isString() && newData.val().length <= 12" },
+                 "1": { ".validate": "newData.isString() && newData.val().length <= 200" },
+                 "2": { ".validate": "newData.isNumber()" },
+                 "$x": { ".validate": "$x === '0' || $x === '1' || $x === '2'" }
+               }
+             },
+             "$other": { ".validate": false }
            },
            "votes": {
              "$k": {
                ".write": true,
-               ".validate": "$k.length <= 60 && newData.hasChildren(['name', 'v']) && newData.child('name').isString() && newData.child('name').val().length <= 40 && newData.child('v').isString() && newData.child('v').val().length <= 100 && newData.child('v').val().matches(/^[012]+$/)"
+               ".validate": "$k.length <= 60 && newData.hasChildren(['name', 'v']) && newData.child('name').isString() && newData.child('name').val().length <= 40 && newData.child('v').isString() && newData.child('v').val().length <= 100 && newData.child('v').val().matches(/^[012]+$/)",
+               "k": { ".validate": "newData.isString() && newData.val().length <= 60" },
+               "at": { ".validate": "newData.isNumber()" },
+               "name": { ".validate": true },
+               "v": { ".validate": true },
+               "$other": { ".validate": false }
              }
            }
          }
@@ -63,6 +85,7 @@ Dan komen de stemmen automatisch binnen en kan iedereen de uitslag live volgen. 
 
 ## Films & posters
 - Een lijst van ±190 bekende films per genre staat in `movies.js` – voeg gerust je eigen favorieten toe (`[IMDb-id zonder "tt", titel, jaar, "genres"]`).
+- De QR-code wordt gemaakt met [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) (MIT, © Kazuhiko Arase), meegeleverd in `vendor/`.
 - Posters, acteurs en de IMDb-link worden in de browser opgehaald via de publieke zoekfunctie van IMDb en lokaal bewaard. Lukt dat niet, dan toont de kaart een gekleurde poster met de titel.
 
 ## Lokaal testen

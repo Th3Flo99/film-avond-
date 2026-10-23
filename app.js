@@ -302,7 +302,12 @@
         const cached = Store.get(jid);
         render('<p class="loading">Sessie laden…</p>');
         try { s = await Remote.loadSession(jid); }
-        catch (err) { if (!(cached && cached.s)) throw new Error('Geen verbinding met de server – probeer het straks opnieuw.'); }
+        catch (err) {
+          if (!(cached && cached.s)) {
+            const offline = err instanceof TypeError || err.message === 'Geen antwoord van de database';
+            throw offline ? new Error('Geen verbinding met de server – probeer het straks opnieuw.') : err;
+          }
+        }
         if (!s && cached && cached.s) s = cached.s; // offline: bewaarde kopie gebruiken
         if (!s) throw new Error('Deze sessie bestaat niet (meer).');
       }
@@ -486,8 +491,8 @@
     $('#b-random').addEventListener('click', () => { pickRandom(); drawGrid(); });
     $('#b-all').addEventListener('click', () => {
       const list = filtered();
-      if (list.length + st.selected.size > MAX_FILMS) toast(`Maximaal ${MAX_FILMS} films – kies een genre om te filteren`);
       [...st.custom, ...shuffle(list.filter((f) => !f.custom))].forEach((f) => { if (st.selected.size < MAX_FILMS) st.selected.set(f.id, f); });
+      if (list.some((f) => !st.selected.has(f.id))) toast(`Maximaal ${MAX_FILMS} films${st.genres.size ? '' : ' – kies een genre om te filteren'}`);
       drawGrid();
     });
     $('#b-none').addEventListener('click', () => { st.selected.clear(); drawGrid(); });
@@ -590,15 +595,7 @@
   }
 
   function drawQR(el, text) {
-    if (typeof window.qrcode !== 'function') {
-      // bibliotheek laadt async; later tekenen zodra ze er is (of weglaten als ze faalt)
-      const lib = document.getElementById('qr-lib');
-      if (lib && !lib.dataset.failed) {
-        lib.addEventListener('load', () => { if (el.isConnected) drawQR(el, text); }, { once: true });
-        lib.addEventListener('error', () => el.remove(), { once: true });
-      } else el.remove();
-      return;
-    }
+    if (typeof window.qrcode !== 'function') { el.remove(); return; }
     try {
       const qr = window.qrcode(0, 'L');
       qr.addData(text);
@@ -619,12 +616,22 @@
     swipeDeck(id);
   }
 
-  function startSwiping(id, s, name) {
+  function startSwiping(id, s, name, forceKey) {
     // Elke deelnemer krijgt een eigen sleutel, zodat twee mensen met dezelfde naam elkaar niet overschrijven.
     // Opnieuw swipen met dezelfde naam houdt de sleutel, zodat de nieuwe stem de oude vervangt.
-    const prev = (Store.get(id) || {}).my;
-    const key = prev && prev.key && prev.name === name ? prev.key : `${keyOf(name).slice(0, 40)}-${uid(4)}`;
+    const e = Store.get(id) || {};
+    const prev = e.my || (e.lastKey ? { key: e.lastKey, name: e.lastName } : null);
+    const key = forceKey || (prev && prev.name === name ? (prev.key || keyOf(name)) : `${keyOf(name).slice(0, 40)}-${uid(4)}`);
     Store.put(id, { my: { key, name, order: shuffle(s.films.map((_, i) => i)), v: s.films.map(() => null), pos: 0 } });
+  }
+
+  // Heeft iemand met deze naam al gestemd (bv. in een andere browser)? Geeft de sleutel van die stem terug.
+  async function existingVoteKey(id, s, name) {
+    let votes = (Store.get(id) || {}).votes || {};
+    if (s.live) { try { votes = await Remote.loadVotes(id); } catch { /* offline: lokale stemmen gebruiken */ } }
+    const same = (a) => String(a || '').trim().toLowerCase() === name.trim().toLowerCase();
+    const hit = Object.entries(validVotes(s, votes)).find(([, v]) => same(v.name));
+    return hit ? hit[0] : null;
   }
 
   function askName(id, s) {
@@ -638,12 +645,18 @@
         <button class="btn btn-big">Start met swipen →</button>
       </form>
     </div>`);
-    $('#name-form').addEventListener('submit', (ev) => {
+    $('#name-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
       const name = $('#f-me').value.trim().slice(0, 40);
       if (!name) return;
+      const btn = $('#name-form button');
+      btn.disabled = true;
+      const existing = await existingVoteKey(id, s, name);
+      btn.disabled = false;
+      if (location.hash !== '#swipe/' + id) return;
+      const replace = existing && confirm(`Er is al een stem van "${name}".\n\nOK = dat ben ik, vervang mijn vorige stem\nAnnuleren = ik ben iemand anders met dezelfde naam`);
       LS.set('fa.name', name);
-      startSwiping(id, s, name);
+      startSwiping(id, s, name, replace ? existing : null);
       swipeDeck(id);
     });
   }
@@ -825,12 +838,12 @@
       const saved = `<div class="info">✅ Je stemmen zijn opgeslagen.</div>
           <div class="btn-row"><a class="btn btn-big" href="#uitslag/${id}">Bekijk de uitslag →</a></div>`;
       // al opgeslagen: niet opnieuw versturen (anders komt een door de organisator verwijderde stem terug)
-      if (my.synced) { box.innerHTML = saved; return bindRedo(); }
+      if (my.synced !== false) { box.innerHTML = saved; return bindRedo(); }
       box.innerHTML = '<p class="muted">Stemmen opslaan…</p>';
       try {
         await Remote.saveVote(id, vote);
         const cur = Store.get(id);
-        if (cur && cur.my) Store.put(id, { my: Object.assign(cur.my, { synced: true }) });
+        if (cur && cur.my) Store.put(id, { my: Object.assign(cur.my, { synced: true, syncedAt: Date.now() }) });
         if (!box.isConnected) return;
         box.innerHTML = saved;
       } catch (err) {
@@ -906,15 +919,16 @@
       const R = computeResults(s, votes);
       const T = s.target, U = R.unanimous.length;
       const waiting = s.people && R.n < s.people ? s.people - R.n : 0;
-      const early = R.n < 2 || waiting > 0; // nog niet iedereen: geen 'match'-oordeel en geen finale
-      const unsynced = s.live && e.my && e.my.done && !e.my.synced;
+      const early = s.people ? waiting > 0 : R.n < 2; // nog niet iedereen: nog geen eindoordeel
+      const unsynced = s.live && e.my && e.my.done && e.my.synced === false;
       const iVoted = e.my && e.my.done && !unsynced;
-      const showFinale = e.mine && !early && R.finale.length > R.finaleTarget;
+      // de organisator kan een finale starten zodra er minstens 2 stemmen zijn (ook als iemand nooit komt opdagen)
+      const showFinale = e.mine && R.n >= 2 && R.finale.length > R.finaleTarget;
 
       let verdict;
       if (!R.n) verdict = { icon: '⏳', title: 'Nog niemand heeft geswiped', text: 'Deel de link en swipe zelf mee.' };
-      else if (!R.top.length) verdict = { icon: '😬', title: 'Niemand had zin in deze films', text: 'Probeer een nieuwe sessie met andere films.' };
       else if (early) verdict = { icon: '⏳', title: `Tussenstand (${plural(R.n, 'stem', 'stemmen')})`, text: 'Wacht tot iedereen geswiped heeft – de uitslag kan nog veranderen.' };
+      else if (!R.top.length) verdict = { icon: '😬', title: 'Niemand had zin in deze films', text: 'Probeer een nieuwe sessie met andere films.' };
       else if (U === 0) verdict = { icon: '🤔', title: 'Geen film waar iedereen ja op zei', text: 'Dit zijn de films met de meeste likes.' };
       else if (U === T) verdict = { icon: '🎉', title: `Perfect! ${plural(U, 'match', 'matches')}`, text: 'Precies zoveel films als jullie wilden.' };
       else if (U < T) verdict = { icon: '🎉', title: `${plural(U, 'match', 'matches')}`, text: R.top.length > U ? `Je wilde er ${T}; aangevuld met de films met de meeste likes.` : `Je wilde er ${T}, maar geen andere film kreeg een like.` };
@@ -940,7 +954,7 @@
 
         ${showFinale ? `<div class="info">🏁 ${R.unanimous.length > T
           ? `${R.finale.length} films kregen een ja van iedereen. Start een finale-ronde met enkel deze films om tot ${T} te komen.`
-          : `Gelijkstand tussen ${R.finale.length} films voor ${R.finaleTarget === T ? '' : 'de laatste '}${plural(R.finaleTarget, 'plaats', 'plaatsen')}. Start een finale-ronde met enkel deze films.`}
+          : `Gelijkstand tussen ${R.finale.length} films voor ${R.finaleTarget === T ? plural(T, 'plaats', 'plaatsen') : R.finaleTarget === 1 ? 'de laatste plaats' : `de laatste ${R.finaleTarget} plaatsen`}. Start een finale-ronde met enkel deze films.`}${waiting ? ' (Nog niet iedereen heeft geswiped.)' : ''}
           <div class="btn-row"><button class="btn" id="b-finale">Start finale-ronde (${R.finale.length} films)</button></div></div>` : ''}
 
         <div class="btn-row">
@@ -975,7 +989,7 @@
         const votes2 = Object.assign({}, cur.votes);
         delete votes2[p.key];
         const patch = { votes: votes2 };
-        if (cur.my && (cur.my.key === p.key || (!cur.my.key && keyOf(cur.my.name) === p.key))) patch.my = null;
+        if (cur.my && (cur.my.key === p.key || (!cur.my.key && (keyOf(cur.my.name) === p.key || cur.my.name === p.name)))) patch.my = null;
         Store.put(id, patch);
         draw();
       }));
@@ -993,12 +1007,14 @@
     async function poll() {
       if (!alive) return;
       try {
+        const asked = Date.now();
         const votes = await Remote.loadVotes(id);
         if (!alive) return;
         const patch = { votes };
         const me = Store.get(id).my;
-        if (me && me.done && me.synced && me.key && !votes[me.key]) {
-          patch.my = null; // de organisator heeft je stem verwijderd
+        // enkel als de vraag vertrok nadat onze stem bevestigd was (anders is het antwoord gewoon verouderd)
+        if (me && me.done && me.synced && me.syncedAt && me.syncedAt < asked && me.key && !votes[me.key]) {
+          Object.assign(patch, { my: null, lastKey: me.key, lastName: me.name }); // de organisator heeft je stem verwijderd
           toast('Je stem werd verwijderd – je kunt opnieuw swipen');
         }
         Store.put(id, patch);
