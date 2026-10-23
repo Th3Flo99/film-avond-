@@ -258,6 +258,24 @@
     return vote;
   }
   const sameFilms = (a, b) => a.films.map((f) => f.id).join() === b.films.map((f) => f.id).join();
+  const sameName = (a, b) => String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+  // Sleutel van de enige andere stem met dezelfde naam (bij 0 of meerdere: null, dan niets aannemen)
+  function sameNameKey(s, votes, name, exceptKey) {
+    const hits = Object.entries(validVotes(s, votes)).filter(([k, v]) => k !== exceptKey && sameName(v.name, name));
+    return hits.length === 1 ? hits[0][0] : null;
+  }
+  // Stem uit een stemlink toevoegen; dezelfde naam onder een andere sleutel (bv. tweede browser) mag die vervangen
+  function addIncomingVote(id, s, vote) {
+    const e = Store.get(id);
+    const key = voteKey(vote);
+    const dup = e.votes && e.votes[key] ? null : sameNameKey(s, e.votes, vote.name, key);
+    if (dup && confirm(`Er is al een stem van "${vote.name}".\n\nOK = vervang die stem (zelfde persoon)\nAnnuleren = tel beide (twee verschillende personen)`)) {
+      const votes = Object.assign({}, e.votes);
+      delete votes[dup];
+      Store.put(id, { votes });
+    }
+    Store.addVote(id, vote);
+  }
 
   function validVotes(s, votes) {
     const out = {};
@@ -323,7 +341,7 @@
       if (v) {
         const vote = voteFromLink(v);
         if (Object.keys(validVotes(s, { x: vote })).length !== 1) throw new Error('Deze stemlink is beschadigd.');
-        Store.addVote(s.id, vote);
+        addIncomingVote(s.id, s, vote);
         toast(`Stemmen van ${vote.name} toegevoegd ✔`);
         location.replace('#uitslag/' + s.id);
       } else {
@@ -629,9 +647,7 @@
   async function existingVoteKey(id, s, name) {
     let votes = (Store.get(id) || {}).votes || {};
     if (s.live) { try { votes = await Remote.loadVotes(id); } catch { /* offline: lokale stemmen gebruiken */ } }
-    const same = (a) => String(a || '').trim().toLowerCase() === name.trim().toLowerCase();
-    const hit = Object.entries(validVotes(s, votes)).find(([, v]) => same(v.name));
-    return hit ? hit[0] : null;
+    return sameNameKey(s, votes, name);
   }
 
   function askName(id, s) {
@@ -647,13 +663,14 @@
     </div>`);
     $('#name-form').addEventListener('submit', async (ev) => {
       ev.preventDefault();
+      const form = ev.currentTarget;
       const name = $('#f-me').value.trim().slice(0, 40);
       if (!name) return;
       const btn = $('#name-form button');
       btn.disabled = true;
       const existing = await existingVoteKey(id, s, name);
       btn.disabled = false;
-      if (location.hash !== '#swipe/' + id) return;
+      if (!form.isConnected || location.hash !== '#swipe/' + id) return; // intussen weg genavigeerd
       const replace = existing && confirm(`Er is al een stem van "${name}".\n\nOK = dat ben ik, vervang mijn vorige stem\nAnnuleren = ik ben iemand anders met dezelfde naam`);
       LS.set('fa.name', name);
       startSwiping(id, s, name, replace ? existing : null);
@@ -923,7 +940,7 @@
       const unsynced = s.live && e.my && e.my.done && e.my.synced === false;
       const iVoted = e.my && e.my.done && !unsynced;
       // de organisator kan een finale starten zodra er minstens 2 stemmen zijn (ook als iemand nooit komt opdagen)
-      const showFinale = e.mine && R.n >= 2 && R.finale.length > R.finaleTarget;
+      const showFinale = e.mine && (R.n >= 2 || !early) && R.finale.length > R.finaleTarget;
 
       let verdict;
       if (!R.n) verdict = { icon: '⏳', title: 'Nog niemand heeft geswiped', text: 'Deel de link en swipe zelf mee.' };
@@ -932,7 +949,7 @@
       else if (U === 0) verdict = { icon: '🤔', title: 'Geen film waar iedereen ja op zei', text: 'Dit zijn de films met de meeste likes.' };
       else if (U === T) verdict = { icon: '🎉', title: `Perfect! ${plural(U, 'match', 'matches')}`, text: 'Precies zoveel films als jullie wilden.' };
       else if (U < T) verdict = { icon: '🎉', title: `${plural(U, 'match', 'matches')}`, text: R.top.length > U ? `Je wilde er ${T}; aangevuld met de films met de meeste likes.` : `Je wilde er ${T}, maar geen andere film kreeg een like.` };
-      else verdict = { icon: '🔥', title: `${U} films door iedereen geliked`, text: `Je wilde er maar ${T}. De top hieronder is gerangschikt op superlikes ⭐${e.mine ? ` – of doe een finale-ronde met enkel deze ${U} films` : ''}.` };
+      else verdict = { icon: '🔥', title: `${U} films door iedereen geliked`, text: `Je wilde er maar ${T}. De top hieronder is gerangschikt op superlikes ⭐${showFinale ? ` – of doe een finale-ronde met enkel deze ${U} films` : ''}.` };
 
       render(`<div class="wrap results">
         <a class="back" href="#">← Start</a>
@@ -989,7 +1006,7 @@
         const votes2 = Object.assign({}, cur.votes);
         delete votes2[p.key];
         const patch = { votes: votes2 };
-        if (cur.my && (cur.my.key === p.key || (!cur.my.key && (keyOf(cur.my.name) === p.key || cur.my.name === p.name)))) patch.my = null;
+        if (cur.my && (cur.my.key === p.key || (!cur.my.key && (keyOf(cur.my.name) === p.key || (p.key === 'anoniem' && cur.my.name === p.name))))) patch.my = null;
         Store.put(id, patch);
         draw();
       }));
@@ -1048,7 +1065,7 @@
         if (ses.id !== s.id) { other++; return; }
         if (!sameFilms(ses, s)) { other++; return; }
         const vote = voteFromLink(p.get('v'));
-        if (Object.keys(validVotes(s, { x: vote })).length) { Store.addVote(id, vote); added++; }
+        if (Object.keys(validVotes(s, { x: vote })).length) { addIncomingVote(id, s, vote); added++; }
       } catch { /* ongeldige link overslaan */ }
     });
     if (added) { toast(`${plural(added, 'stem', 'stemmen')} toegevoegd ✔`); redraw(); }

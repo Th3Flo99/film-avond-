@@ -48,6 +48,7 @@ Dan komen de stemmen automatisch binnen en kan iedereen de uitslag live volgen. 
              "p": { ".validate": "newData.isNumber()" },
              "l": { ".validate": "newData.isNumber()" },
              "f": {
+               ".validate": "newData.hasChildren()",
                "$n": {
                  ".validate": "$n.length <= 2 && ((newData.isString() && newData.val().length <= 12) || newData.hasChildren(['0', '1']))",
                  "0": { ".validate": "newData.isString() && newData.val().length <= 12" },
