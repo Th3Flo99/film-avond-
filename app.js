@@ -20,9 +20,13 @@
   const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const render = (html) => { app.innerHTML = html; };
   const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
-  const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '')
+  const norm = (s) => String(s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '')
     .replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim();
-  const keyOf = (name) => norm(name).replace(/\s+/g, '-').slice(0, 40) || 'anoniem';
+  // Sleutel voor een naam; namen zonder Latijnse letters (bv. emoji) krijgen een hash i.p.v. allemaal dezelfde sleutel.
+  const keyOf = (name) => norm(name).replace(/\s+/g, '-').slice(0, 40)
+    || 'n' + [...String(name || '').trim()].reduce((h, c) => (Math.imul(h, 31) + c.codePointAt(0)) >>> 0, 7).toString(36);
+  const KEY_RE = /^[a-z0-9-]{1,60}$/;
+  const voteKey = (v) => (typeof v.k === 'string' && KEY_RE.test(v.k) ? v.k : keyOf(v.name));
 
   const LS = {
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } },
@@ -116,11 +120,12 @@
   const yearOk = (d, film) => !film.year || !d.y || Math.abs(d.y - film.year) <= 1;
 
   async function resolvePoster(film) {
-    let byId = null;
+    let byId = null, err = null;
     try {
       byId = (await imdbSuggest(film.id)).find((d) => d.id === film.id) || null;
       if (byId && titleOk(byId.l, film.title) && yearOk(byId, film)) return pack(byId);
-    } catch { /* val terug op zoeken op titel */ }
+    } catch (e) { err = e; /* val terug op zoeken op titel */ }
+    if (err && film.custom) throw err; // niet als 'geen poster' cachen als IMDb niet antwoordde
     if (!film.custom) {
       const list = await imdbSuggest(film.title);
       const hit = list.find((d) => titleOk(d.l, film.title) && yearOk(d, film)) || list.find((d) => yearOk(d, film) && d.y);
@@ -134,10 +139,11 @@
 
   function posterHTML(film, w = 300) {
     return `<div class="poster" data-pid="${esc(film.id)}" data-w="${w}" style="--h:${hue(film.title)}">
-      <div class="poster-fallback"><span>${esc(film.title)}</span>${film.year ? `<small>${film.year}</small>` : ''}</div>
+      <div class="poster-fallback"><span>${esc(film.title)}</span>${film.year ? `<small>${esc(film.year)}</small>` : ''}</div>
     </div>`;
   }
 
+  const LOADED = new Set(); // al geladen posters: niet opnieuw laten infaden
   function hydratePoster(el) {
     if (el.dataset.done) return;
     el.dataset.done = '1';
@@ -149,9 +155,11 @@
         const img = new Image();
         img.alt = film.title;
         img.decoding = 'async';
-        img.onload = () => el.classList.add('loaded');
-        img.src = sized(info.img, el.dataset.w);
+        const src = sized(info.img, el.dataset.w);
+        img.onload = () => { LOADED.add(src); el.classList.add('loaded'); };
+        img.src = src;
         el.prepend(img);
+        if (LOADED.has(src)) el.classList.add('loaded');
       }
       $$(`[data-imdb="${CSS.escape(film.id)}"]`).forEach((a) => { a.href = imdbUrl(film); });
       $$(`[data-stars="${CSS.escape(film.id)}"]`).forEach((s) => { s.textContent = info.stars ? `Met ${info.stars}` : ''; });
@@ -191,7 +199,8 @@
     films.forEach((f) => { if (!FILMS.has(f.id)) FILMS.set(f.id, f); });
     return {
       id: String(o.i).replace(/[^a-z0-9]/gi, ''), name: String(o.n || 'Filmavond'), host: String(o.h || ''),
-      target: Math.max(1, +o.t || 3), people: +o.p || 0, live: !!o.l, films,
+      target: Math.min(10, Math.max(1, Math.round(+o.t) || 3)), people: Math.min(30, Math.max(0, Math.round(+o.p) || 0)),
+      live: !!o.l, films,
     };
   }
 
@@ -211,7 +220,7 @@
     addVote(id, vote) {
       const e = this.get(id);
       if (!e) return;
-      const votes = Object.assign({}, e.votes, { [keyOf(vote.name)]: vote });
+      const votes = Object.assign({}, e.votes, { [voteKey(vote)]: vote });
       this.put(id, { votes });
     },
     remove(id) { const all = this.all(); delete all[id]; LS.set('fa.sessions', all); },
@@ -220,25 +229,40 @@
   const Remote = {
     async req(path, opts = {}) {
       if (!LIVE) throw new Error('Geen live database ingesteld (config.js).');
-      const res = await fetch(`${DB}/${path}.json`, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts));
-      if (!res.ok) throw new Error(`Database gaf fout ${res.status}`);
-      return res.json();
+      const ctl = new AbortController();
+      const timer = setTimeout(() => ctl.abort(), 10000);
+      try {
+        const res = await fetch(`${DB}/${path}.json`, Object.assign({ headers: { 'Content-Type': 'application/json' }, signal: ctl.signal }, opts));
+        if (!res.ok) throw new Error(`Database gaf fout ${res.status}`);
+        return await res.json();
+      } catch (e) {
+        throw e && e.name === 'AbortError' ? new Error('Geen antwoord van de database') : e;
+      } finally { clearTimeout(timer); }
     },
     saveSession(s) { return this.req(`sessions/${s.id}/meta`, { method: 'PUT', body: JSON.stringify(packSession(s)) }); },
     async loadSession(id) { const m = await this.req(`sessions/${id}/meta`); return m ? unpackSession(m) : null; },
-    saveVote(id, vote) { return this.req(`sessions/${id}/votes/${keyOf(vote.name)}`, { method: 'PUT', body: JSON.stringify(vote) }); },
+    saveVote(id, vote) { return this.req(`sessions/${id}/votes/${voteKey(vote)}`, { method: 'PUT', body: JSON.stringify(vote) }); },
     deleteVote(id, key) { return this.req(`sessions/${id}/votes/${key}`, { method: 'DELETE' }); },
     async loadVotes(id) { return (await this.req(`sessions/${id}/votes`)) || {}; },
   };
 
   const baseUrl = () => location.href.split('#')[0];
   const joinLink = (s) => (s.live ? `${baseUrl()}#j=${s.id}` : `${baseUrl()}#s=${b64e(JSON.stringify(packSession(s)))}`);
-  const replyLink = (s, vote) => `${baseUrl()}#s=${b64e(JSON.stringify(packSession(s)))}&v=${b64e(JSON.stringify({ n: vote.name, v: vote.v }))}`;
+  const replyLink = (s, vote) => `${baseUrl()}#s=${b64e(JSON.stringify(packSession(s)))}&v=${b64e(JSON.stringify({ n: vote.name, v: vote.v, k: vote.k }))}`;
+  // Stem uit een stemlink lezen (naam en sleutel komen van buitenaf: opschonen)
+  function voteFromLink(raw) {
+    const o = JSON.parse(b64d(raw));
+    const vote = { name: String(o.n || 'Anoniem').slice(0, 40), v: String(o.v || ''), at: Date.now() };
+    const k = String(o.k || '');
+    if (KEY_RE.test(k)) vote.k = k;
+    return vote;
+  }
+  const sameFilms = (a, b) => a.films.map((f) => f.id).join() === b.films.map((f) => f.id).join();
 
   function validVotes(s, votes) {
     const out = {};
     Object.entries(votes || {}).forEach(([k, v]) => {
-      if (v && typeof v.v === 'string' && v.v.length === s.films.length && /^[012]+$/.test(v.v)) out[k] = v;
+      if (KEY_RE.test(k) && v && typeof v.v === 'string' && v.v.length === s.films.length && /^[012]+$/.test(v.v)) out[k] = v;
     });
     return out;
   }
@@ -274,15 +298,25 @@
       if (params.get('s')) {
         s = unpackSession(JSON.parse(b64d(params.get('s'))));
       } else {
+        const jid = String(params.get('j')).replace(/[^a-z0-9]/gi, '');
+        const cached = Store.get(jid);
         render('<p class="loading">Sessie laden…</p>');
-        s = await Remote.loadSession(String(params.get('j')).replace(/[^a-z0-9]/gi, ''));
+        try { s = await Remote.loadSession(jid); }
+        catch (err) { if (!(cached && cached.s)) throw new Error('Geen verbinding met de server – probeer het straks opnieuw.'); }
+        if (!s && cached && cached.s) s = cached.s; // offline: bewaarde kopie gebruiken
         if (!s) throw new Error('Deze sessie bestaat niet (meer).');
       }
-      Store.put(s.id, { s });
+      const prev = Store.get(s.id);
+      if (prev && prev.s) {
+        // de bewaarde sessie wint; een link kan ze niet overschrijven
+        if (!sameFilms(prev.s, s)) throw new Error('Deze link hoort niet bij de sessie op dit toestel.');
+        s = prev.s;
+      } else {
+        Store.put(s.id, { s });
+      }
       const v = params.get('v');
       if (v) {
-        const o = JSON.parse(b64d(v));
-        const vote = { name: String(o.n || 'Anoniem').slice(0, 40), v: String(o.v || ''), at: Date.now() };
+        const vote = voteFromLink(v);
         if (Object.keys(validVotes(s, { x: vote })).length !== 1) throw new Error('Deze stemlink is beschadigd.');
         Store.addVote(s.id, vote);
         toast(`Stemmen van ${vote.name} toegevoegd ✔`);
@@ -409,15 +443,15 @@
       $('#count').textContent = n ? `${plural(n, 'film', 'films')} gekozen` : (st.genres.size ? 'Nog niets gekozen – dan nemen we willekeurige films uit deze genres' : 'Tik op films om ze te kiezen');
       const b = $('#b-create');
       if (n >= 2) { b.textContent = `Start sessie met ${n} films →`; b.disabled = false; }
-      else if (!n && st.genres.size) { b.textContent = `Start met ${Math.min(st.randomN, filtered().length)} willekeurige films →`; b.disabled = false; }
-      else { b.textContent = 'Kies minstens 2 films of een genre'; b.disabled = true; }
+      else if (!n && st.genres.size) { b.textContent = `Start met ${Math.min(st.randomN, filtered().filter((f) => !f.custom).length)} willekeurige films →`; b.disabled = false; }
+      else { b.textContent = n === 1 ? 'Kies nog minstens 1 film' : 'Kies minstens 2 films of een genre'; b.disabled = true; }
     }
 
     function drawGrid() {
       const list = filtered();
       grid.innerHTML = list.map((f) => `<button type="button" class="tile ${st.selected.has(f.id) ? 'on' : ''}" data-id="${esc(f.id)}">
         ${posterHTML(f, 220)}<span class="tile-check">✓</span>
-        <span class="tile-title">${esc(f.title)}${f.year ? ` <small>${f.year}</small>` : ''}</span></button>`).join('');
+        <span class="tile-title">${esc(f.title)}${f.year ? ` <small>${esc(f.year)}</small>` : ''}</span></button>`).join('');
       hydratePosters(grid, true);
       updateCount();
     }
@@ -451,7 +485,9 @@
     $('#f-random').addEventListener('change', (e) => { st.randomN = +e.target.value; updateCount(); });
     $('#b-random').addEventListener('click', () => { pickRandom(); drawGrid(); });
     $('#b-all').addEventListener('click', () => {
-      filtered().slice(0, MAX_FILMS).forEach((f) => { if (st.selected.size < MAX_FILMS) st.selected.set(f.id, f); });
+      const list = filtered();
+      if (list.length + st.selected.size > MAX_FILMS) toast(`Maximaal ${MAX_FILMS} films – kies een genre om te filteren`);
+      [...st.custom, ...shuffle(list.filter((f) => !f.custom))].forEach((f) => { if (st.selected.size < MAX_FILMS) st.selected.set(f.id, f); });
       drawGrid();
     });
     $('#b-none').addEventListener('click', () => { st.selected.clear(); drawGrid(); });
@@ -461,15 +497,16 @@
     let sTimer, sSeq = 0;
     sInput.addEventListener('input', () => {
       clearTimeout(sTimer);
+      sSeq++; // lopende zoekopdrachten zijn nu verouderd
       const q = sInput.value.trim();
       if (q.length < 2) { sBox.innerHTML = ''; return; }
       sTimer = setTimeout(async () => {
         const seq = ++sSeq;
         sBox.innerHTML = '<p class="muted small pad">Zoeken…</p>';
         try {
-          const res = (await imdbSuggest(q)).filter((d) => !d.qid || /movie|tvSeries|tvMiniSeries|tvMovie|video/.test(d.qid)).slice(0, 8);
+          const res = (await imdbSuggest(q)).filter((d) => !d.qid || /^(movie|tvSeries|tvMiniSeries|tvMovie|video)$/.test(d.qid)).slice(0, 8);
           if (seq !== sSeq) return;
-          sBox.innerHTML = res.length ? res.map((d) => `<button type="button" class="search-hit" data-hit='${esc(JSON.stringify({ id: d.id, l: d.l, y: d.y || 0, img: d.i ? d.i.imageUrl : null, s: d.s || '' }))}'>
+          sBox.innerHTML = res.length ? res.map((d) => `<button type="button" class="search-hit" data-hit='${esc(JSON.stringify({ id: d.id, l: d.l, y: +d.y || 0, img: d.i ? d.i.imageUrl : null, s: d.s || '' }))}'>
               ${d.i ? `<img src="${esc(sized(d.i.imageUrl, 80))}" alt="">` : '<span class="noimg">🎬</span>'}
               <span><b>${esc(d.l)}</b><small>${[d.y, d.q, d.s].filter(Boolean).map(esc).join(' · ')}</small></span><i>+</i></button>`).join('')
             : '<p class="muted small pad">Niets gevonden.</p>';
@@ -484,13 +521,14 @@
       const d = JSON.parse(b.dataset.hit);
       let f = FILMS.get(d.id);
       if (!f) {
-        f = { id: d.id, title: d.l, year: d.y, genres: [], custom: true };
+        f = { id: d.id, title: String(d.l || d.id), year: +d.y || 0, genres: [], custom: true };
         FILMS.set(f.id, f);
         Posters.seed(f.id, { id: d.id, img: d.img, stars: d.s });
       }
       if (f.custom && !st.custom.some((c) => c.id === f.id)) st.custom.unshift(f);
       if (st.selected.size >= MAX_FILMS) return toast(`Maximaal ${MAX_FILMS} films per sessie`);
       st.selected.set(f.id, f);
+      clearTimeout(sTimer); sSeq++;
       sInput.value = ''; sBox.innerHTML = '';
       toast(`${f.title} toegevoegd`);
       drawGrid();
@@ -503,7 +541,8 @@
       if (st.selected.size < 2) { toast('Kies minstens 2 films'); return; }
       const s = {
         id: uid(), name: $('#f-name').value.trim() || $('#f-name').placeholder, host,
-        target: st.target, people: st.people, live: LIVE, films: [...st.selected.values()],
+        // minstens 1 film minder overhouden dan er zijn, anders valt er niets te kiezen
+        target: Math.min(st.target, Math.max(1, st.selected.size - 1)), people: st.people, live: LIVE, films: [...st.selected.values()],
       };
       const btn = $('#b-create');
       btn.disabled = true; btn.textContent = 'Bezig…';
@@ -551,7 +590,15 @@
   }
 
   function drawQR(el, text) {
-    if (typeof window.qrcode !== 'function') { el.remove(); return; }
+    if (typeof window.qrcode !== 'function') {
+      // bibliotheek laadt async; later tekenen zodra ze er is (of weglaten als ze faalt)
+      const lib = document.getElementById('qr-lib');
+      if (lib && !lib.dataset.failed) {
+        lib.addEventListener('load', () => { if (el.isConnected) drawQR(el, text); }, { once: true });
+        lib.addEventListener('error', () => el.remove(), { once: true });
+      } else el.remove();
+      return;
+    }
     try {
       const qr = window.qrcode(0, 'L');
       qr.addData(text);
@@ -573,7 +620,11 @@
   }
 
   function startSwiping(id, s, name) {
-    Store.put(id, { my: { name, order: shuffle(s.films.map((_, i) => i)), v: s.films.map(() => null), pos: 0 } });
+    // Elke deelnemer krijgt een eigen sleutel, zodat twee mensen met dezelfde naam elkaar niet overschrijven.
+    // Opnieuw swipen met dezelfde naam houdt de sleutel, zodat de nieuwe stem de oude vervangt.
+    const prev = (Store.get(id) || {}).my;
+    const key = prev && prev.key && prev.name === name ? prev.key : `${keyOf(name).slice(0, 40)}-${uid(4)}`;
+    Store.put(id, { my: { key, name, order: shuffle(s.films.map((_, i) => i)), v: s.films.map(() => null), pos: 0 } });
   }
 
   function askName(id, s) {
@@ -621,8 +672,8 @@
 
     function save() { Store.put(id, { my }); }
 
-    function cardHTML(film, depth) {
-      return `<article class="card" data-depth="${depth}" style="--depth:${depth}">
+    function cardHTML(film, depth, idx) {
+      return `<article class="card" data-idx="${idx}" data-depth="${depth}" style="--depth:${depth}">
         ${posterHTML(film, 600)}
         <div class="stamp stamp-yes">ZIN IN</div><div class="stamp stamp-no">NEE</div><div class="stamp stamp-super">SUPER ★</div>
         <div class="card-info">
@@ -634,33 +685,41 @@
     }
 
     function draw() {
-      $$('.card:not(.gone)', deck).forEach((c) => c.remove());
       const n = s.films.length;
       $('#progress').textContent = `${Math.min(my.pos + 1, n)} / ${n}`;
       $('#bar').style.width = `${(my.pos / n) * 100}%`;
       $('#b-undo').disabled = my.pos === 0;
-      if (my.pos >= n) return finish();
+      // bestaande kaarten behouden (geen flits), enkel diepte aanpassen en ontbrekende toevoegen
       const next = my.order.slice(my.pos, my.pos + 3);
-      next.slice().reverse().forEach((idx, k) => {
-        deck.insertAdjacentHTML('beforeend', cardHTML(s.films[idx], next.length - 1 - k));
+      const existing = new Map($$('.card:not(.gone)', deck).map((c) => [+c.dataset.idx, c]));
+      existing.forEach((c, idx) => { if (!next.includes(idx)) c.remove(); });
+      if (my.pos >= n) return finish();
+      next.forEach((idx, depth) => {
+        let c = existing.get(idx);
+        if (!c) { deck.insertAdjacentHTML('afterbegin', cardHTML(s.films[idx], depth, idx)); c = deck.firstElementChild; }
+        c.dataset.depth = depth;
+        c.style.setProperty('--depth', depth);
       });
       hydratePosters(deck);
       // posters van de volgende kaarten alvast laden
       my.order.slice(my.pos + 3, my.pos + 6).forEach((idx) => Posters.get(s.films[idx]));
       const top = $('.card[data-depth="0"]', deck);
-      if (top) bindDrag(top);
+      if (top && !top.dataset.bound) { top.dataset.bound = '1'; bindDrag(top); }
     }
 
+    // Eén drempel voor zowel de stempels tijdens het slepen als de beslissing bij loslaten
+    const limOf = (card) => Math.min(120, card.offsetWidth * 0.28);
     function setStamps(card, dx, dy) {
       const c = (x) => Math.max(0, Math.min(1, x));
-      const sup = Math.abs(dx) < 60 ? c(-dy / 110) : 0;
-      $('.stamp-yes', card).style.opacity = c(dx / 90) * (1 - sup);
-      $('.stamp-no', card).style.opacity = c(-dx / 90) * (1 - sup);
+      const lim = limOf(card);
+      const sup = Math.abs(dx) < lim ? c(-dy / 110) : 0;
+      $('.stamp-yes', card).style.opacity = c(dx / lim) * (1 - sup);
+      $('.stamp-no', card).style.opacity = c(-dx / lim) * (1 - sup);
       $('.stamp-super', card).style.opacity = sup;
     }
 
     function decide(val) {
-      if (busy || my.pos >= s.films.length) return;
+      if (busy || my.done || my.pos >= s.films.length) return;
       const card = $('.card[data-depth="0"]', deck);
       busy = true;
       my.v[my.order[my.pos]] = val;
@@ -681,7 +740,7 @@
     }
 
     function undo() {
-      if (my.pos === 0) return;
+      if (my.done || my.pos === 0) return;
       my.pos--;
       my.v[my.order[my.pos]] = null;
       save();
@@ -707,7 +766,7 @@
         if (ev.pointerId !== pid) return;
         pid = null;
         card.classList.remove('dragging');
-        const lim = Math.min(120, card.offsetWidth * 0.28);
+        const lim = limOf(card);
         if (dx > lim) decide('1');
         else if (dx < -lim) decide('0');
         else if (dy < -110 && Math.abs(dx) < lim) decide('2');
@@ -718,16 +777,21 @@
     }
 
     function finish() {
-      const vote = { name: my.name, v: my.v.map((x) => x || '0').join(''), at: Date.now() };
+      const vote = { k: my.key, name: my.name, v: my.v.map((x) => x || '0').join(''), at: Date.now() };
       my.done = true;
+      my.synced = false;
       Store.put(id, { my });
       Store.addVote(id, vote);
+      $('#b-undo').disabled = true;
+      document.removeEventListener('keydown', onKey);
       setTimeout(() => swipeDone(id), 250);
     }
 
     $('.controls').addEventListener('click', (ev) => { const b = ev.target.closest('[data-v]'); if (b) decide(b.dataset.v); });
     $('#b-undo').addEventListener('click', undo);
     const onKey = (ev) => {
+      if (my.done || !deck.isConnected || ev.altKey || ev.metaKey || ev.ctrlKey) return;
+      if (ev.target && ev.target.closest && ev.target.closest('input,textarea,select')) return;
       if (ev.key === 'ArrowRight') decide('1');
       else if (ev.key === 'ArrowLeft') decide('0');
       else if (ev.key === 'ArrowUp') { ev.preventDefault(); decide('2'); }
@@ -742,7 +806,7 @@
     if (location.hash !== '#swipe/' + id) return; // gebruiker is intussen weg genavigeerd
     document.body.classList.remove('swiping');
     const e = Store.get(id), s = e.s, my = e.my;
-    const vote = { name: my.name, v: my.v.map((x) => x || '0').join(''), at: Date.now() };
+    const vote = { k: my.key, name: my.name, v: my.v.map((x) => x || '0').join(''), at: Date.now() };
     const likes = [...vote.v].filter((c) => c !== '0').length;
     const supers = [...vote.v].filter((c) => c === '2').length;
     const reply = replyLink(s, vote);
@@ -758,12 +822,19 @@
     const box = $('#done-actions');
 
     if (s.live) {
+      const saved = `<div class="info">✅ Je stemmen zijn opgeslagen.</div>
+          <div class="btn-row"><a class="btn btn-big" href="#uitslag/${id}">Bekijk de uitslag →</a></div>`;
+      // al opgeslagen: niet opnieuw versturen (anders komt een door de organisator verwijderde stem terug)
+      if (my.synced) { box.innerHTML = saved; return bindRedo(); }
       box.innerHTML = '<p class="muted">Stemmen opslaan…</p>';
       try {
         await Remote.saveVote(id, vote);
-        box.innerHTML = `<div class="info">✅ Je stemmen zijn opgeslagen.</div>
-          <div class="btn-row"><a class="btn btn-big" href="#uitslag/${id}">Bekijk de uitslag →</a></div>`;
+        const cur = Store.get(id);
+        if (cur && cur.my) Store.put(id, { my: Object.assign(cur.my, { synced: true }) });
+        if (!box.isConnected) return;
+        box.innerHTML = saved;
       } catch (err) {
+        if (!box.isConnected) return;
         box.innerHTML = `<div class="info warn">⚠️ Opslaan mislukt (${esc(err.message)}).</div>
           <div class="btn-row"><button class="btn" id="b-retry">Opnieuw proberen</button></div>`;
         $('#b-retry').addEventListener('click', () => swipeDone(id));
@@ -784,11 +855,14 @@
       $('#b-copy').addEventListener('click', () => copyText(reply, 'Stemlink gekopieerd 📋'));
     }
 
-    $('#b-redo').addEventListener('click', () => {
-      if (!confirm('Je huidige stemmen wissen en opnieuw beginnen?')) return;
-      startSwiping(id, s, my.name);
-      viewSwipe(id);
-    });
+    bindRedo();
+    function bindRedo() {
+      $('#b-redo').addEventListener('click', () => {
+        if (!confirm('Je huidige stemmen wissen en opnieuw beginnen?')) return;
+        startSwiping(id, s, my.name);
+        route(); // ruimt de vorige weergave netjes op
+      });
+    }
   }
 
   // ---------- Uitslag ----------
@@ -803,14 +877,17 @@
     const unanimous = n ? rows.filter((r) => r.likes === n) : [];
     const T = s.target;
     const top = rows.filter((r) => r.likes > 0).slice(0, T);
-    let finale = [];
+    // Finale: te veel matches, of een gelijkstand op de laatste plaats(en).
+    // Bij een gelijkstand gaan enkel de gelijke films door; wie al zeker bij de top hoort, blijft daar.
+    let finale = [], finaleTarget = T;
     if (unanimous.length > T) finale = unanimous;
     else if (rows.length > T && top.length === T) {
       const edge = rows[T - 1];
-      const tied = rows.filter((r) => r.likes > edge.likes || (r.likes === edge.likes && r.supers >= edge.supers));
-      if (tied.length > T) finale = tied;
+      const locked = rows.filter((r) => r.likes > edge.likes || (r.likes === edge.likes && r.supers > edge.supers));
+      const tied = rows.filter((r) => r.likes === edge.likes && r.supers === edge.supers);
+      if (locked.length + tied.length > T) { finale = tied; finaleTarget = T - locked.length; }
     }
-    return { people, n, rows, unanimous, top, finale };
+    return { people, n, rows, unanimous, top, finale, finaleTarget };
   }
 
   function viewResults(id) {
@@ -820,6 +897,7 @@
     let alive = true;
 
     function draw() {
+      if (!alive) return; // intussen naar een andere pagina gegaan
       const e = Store.get(id), s = e.s;
       const votes = validVotes(s, e.votes);
       const key = JSON.stringify(votes);
@@ -828,14 +906,19 @@
       const R = computeResults(s, votes);
       const T = s.target, U = R.unanimous.length;
       const waiting = s.people && R.n < s.people ? s.people - R.n : 0;
-      const iVoted = e.my && e.my.done;
+      const early = R.n < 2 || waiting > 0; // nog niet iedereen: geen 'match'-oordeel en geen finale
+      const unsynced = s.live && e.my && e.my.done && !e.my.synced;
+      const iVoted = e.my && e.my.done && !unsynced;
+      const showFinale = e.mine && !early && R.finale.length > R.finaleTarget;
 
       let verdict;
       if (!R.n) verdict = { icon: '⏳', title: 'Nog niemand heeft geswiped', text: 'Deel de link en swipe zelf mee.' };
+      else if (!R.top.length) verdict = { icon: '😬', title: 'Niemand had zin in deze films', text: 'Probeer een nieuwe sessie met andere films.' };
+      else if (early) verdict = { icon: '⏳', title: `Tussenstand (${plural(R.n, 'stem', 'stemmen')})`, text: 'Wacht tot iedereen geswiped heeft – de uitslag kan nog veranderen.' };
       else if (U === 0) verdict = { icon: '🤔', title: 'Geen film waar iedereen ja op zei', text: 'Dit zijn de films met de meeste likes.' };
       else if (U === T) verdict = { icon: '🎉', title: `Perfect! ${plural(U, 'match', 'matches')}`, text: 'Precies zoveel films als jullie wilden.' };
-      else if (U < T) verdict = { icon: '🎉', title: `${plural(U, 'match', 'matches')}`, text: `Je wilde er ${T}; aangevuld met de films met de meeste likes.` };
-      else verdict = { icon: '🔥', title: `${U} films door iedereen geliked`, text: `Je wilde er maar ${T}. De top hieronder is gerangschikt op superlikes ⭐ – of doe een finale-ronde met enkel deze ${U} films.` };
+      else if (U < T) verdict = { icon: '🎉', title: `${plural(U, 'match', 'matches')}`, text: R.top.length > U ? `Je wilde er ${T}; aangevuld met de films met de meeste likes.` : `Je wilde er ${T}, maar geen andere film kreeg een like.` };
+      else verdict = { icon: '🔥', title: `${U} films door iedereen geliked`, text: `Je wilde er maar ${T}. De top hieronder is gerangschikt op superlikes ⭐${e.mine ? ` – of doe een finale-ronde met enkel deze ${U} films` : ''}.` };
 
       render(`<div class="wrap results">
         <a class="back" href="#">← Start</a>
@@ -843,7 +926,7 @@
         <p class="muted">${plural(s.films.length, 'film', 'films')} · doel: ${s.target} · ${s.live ? '⚡ live' : 'via stemlinks'}</p>
 
         <div class="people">
-          ${R.people.map((p) => `<span class="person">✓ ${esc(p.name)}<button data-rm="${esc(p.key)}" aria-label="Verwijder ${esc(p.name)}">×</button></span>`).join('')}
+          ${R.people.map((p) => `<span class="person">✓ ${esc(p.name)}${e.mine ? `<button data-rm="${esc(p.key)}" aria-label="Verwijder ${esc(p.name)}">×</button>` : ''}</span>`).join('')}
           ${waiting ? Array.from({ length: waiting }, () => '<span class="person pending">⏳ …</span>').join('') : ''}
         </div>
         ${waiting ? `<p class="muted small">Nog ${plural(waiting, 'persoon', 'personen')} moet${waiting === 1 ? '' : 'en'} swipen – de uitslag kan nog veranderen.</p>` : ''}
@@ -853,14 +936,15 @@
         ${R.top.length ? `<h2>${R.top.length === 1 ? 'Jullie film' : `Jullie top ${R.top.length}`}</h2>
         <div class="winners">${R.top.map((r, k) => `<a class="winner" data-imdb="${esc(r.film.id)}" href="${esc(imdbUrl(r.film))}" target="_blank" rel="noopener">
             <span class="rank">${k + 1}</span>${posterHTML(r.film, 300)}
-            <b>${esc(r.film.title)}</b><small>${r.film.year || ''} · ${r.likes}/${R.n} ❤️${r.supers ? ` · ${r.supers} ⭐` : ''}</small></a>`).join('')}</div>` : ''}
+            <b>${esc(r.film.title)}</b><small>${esc(r.film.year || '')} · ${r.likes}/${R.n} ❤️${r.supers ? ` · ${r.supers} ⭐` : ''}</small></a>`).join('')}</div>` : ''}
 
-        ${R.finale.length > T ? `<div class="info">🏁 ${R.unanimous.length > T ? `${R.finale.length} films kregen een ja van iedereen.` : `Er is een gelijkstand tussen ${R.finale.length} films.`}
-          Start een finale-ronde met enkel deze films om tot ${T} te komen.
+        ${showFinale ? `<div class="info">🏁 ${R.unanimous.length > T
+          ? `${R.finale.length} films kregen een ja van iedereen. Start een finale-ronde met enkel deze films om tot ${T} te komen.`
+          : `Gelijkstand tussen ${R.finale.length} films voor ${R.finaleTarget === T ? '' : 'de laatste '}${plural(R.finaleTarget, 'plaats', 'plaatsen')}. Start een finale-ronde met enkel deze films.`}
           <div class="btn-row"><button class="btn" id="b-finale">Start finale-ronde (${R.finale.length} films)</button></div></div>` : ''}
 
         <div class="btn-row">
-          ${iVoted ? '' : `<a class="btn" href="#swipe/${id}">Zelf swipen</a>`}
+          ${unsynced ? `<a class="btn" href="#swipe/${id}">⚠️ Je stem is nog niet opgeslagen – opnieuw versturen</a>` : iVoted ? '' : `<a class="btn" href="#swipe/${id}">Zelf swipen</a>`}
           ${e.mine ? `<a class="btn btn-ghost" href="#deel/${id}">Link delen</a>` : ''}
           ${s.live ? '' : '<button class="btn btn-ghost" id="b-paste">Stemlink plakken</button>'}
         </div>
@@ -873,7 +957,7 @@
         <ol class="ranking">${R.rows.map((r) => `<li class="${R.n && r.likes === R.n ? 'match' : ''}">
           ${posterHTML(r.film, 120)}
           <div class="r-main">
-            <b>${esc(r.film.title)}</b> <small>${r.film.year || ''}</small>
+            <b>${esc(r.film.title)}</b> <small>${esc(r.film.year || '')}</small>
             <div class="meter"><i style="width:${R.n ? (r.likes / R.n) * 100 : 0}%"></i></div>
             <small class="muted">${r.likes}/${R.n} ❤️${r.supers ? ` · ${r.supers} ⭐` : ''}${r.likedBy.length ? ` · ${esc(r.likedBy.join(', '))}` : ''}</small>
           </div>
@@ -891,13 +975,13 @@
         const votes2 = Object.assign({}, cur.votes);
         delete votes2[p.key];
         const patch = { votes: votes2 };
-        if (cur.my && cur.my.name && keyOf(cur.my.name) === p.key) patch.my = null;
+        if (cur.my && (cur.my.key === p.key || (!cur.my.key && keyOf(cur.my.name) === p.key))) patch.my = null;
         Store.put(id, patch);
         draw();
       }));
 
       const fin = $('#b-finale');
-      if (fin) fin.addEventListener('click', () => startFinale(s, R.finale.map((r) => r.film), fin));
+      if (fin) fin.addEventListener('click', () => startFinale(s, R.finale.map((r) => r.film), R.finaleTarget, fin));
 
       const paste = $('#b-paste');
       if (paste) {
@@ -909,7 +993,15 @@
     async function poll() {
       if (!alive) return;
       try {
-        Store.put(id, { votes: await Remote.loadVotes(id) });
+        const votes = await Remote.loadVotes(id);
+        if (!alive) return;
+        const patch = { votes };
+        const me = Store.get(id).my;
+        if (me && me.done && me.synced && me.key && !votes[me.key]) {
+          patch.my = null; // de organisator heeft je stem verwijderd
+          toast('Je stem werd verwijderd – je kunt opnieuw swipen');
+        }
+        Store.put(id, patch);
         draw();
       } catch (err) {
         if (alive) toast('Live verbinding mislukt: ' + err.message);
@@ -917,6 +1009,7 @@
     }
 
     draw();
+    cleanup = () => { alive = false; };
     if (e0.s.live) {
       if (!LIVE) { toast('Deze sessie is live, maar er is geen database ingesteld.'); return; }
       poll();
@@ -937,8 +1030,8 @@
         const ses = unpackSession(JSON.parse(b64d(p.get('s'))));
         if (!p.get('v')) return;
         if (ses.id !== s.id) { other++; return; }
-        const o = JSON.parse(b64d(p.get('v')));
-        const vote = { name: String(o.n || 'Anoniem').slice(0, 40), v: String(o.v || ''), at: Date.now() };
+        if (!sameFilms(ses, s)) { other++; return; }
+        const vote = voteFromLink(p.get('v'));
         if (Object.keys(validVotes(s, { x: vote })).length) { Store.addVote(id, vote); added++; }
       } catch { /* ongeldige link overslaan */ }
     });
@@ -946,9 +1039,11 @@
     else toast(other ? 'Die stemlink hoort bij een andere sessie.' : 'Geen geldige stemlink gevonden.');
   }
 
-  async function startFinale(s, films, btn) {
+  async function startFinale(s, films, target, btn) {
     const base = s.name.replace(/ – finale( \d+)?$/, '');
-    const ns = { id: uid(), name: `${base} – finale`, host: s.host, target: s.target, people: s.people, live: s.live, films };
+    const me = (Store.get(s.id) || {}).my;
+    const host = (me && me.name) || LS.get('fa.name', '') || s.host;
+    const ns = { id: uid(), name: `${base} – finale`, host, target, people: s.people, live: s.live, films };
     if (ns.live) {
       btn.disabled = true;
       try { await Remote.saveSession(ns); }

@@ -35,18 +35,31 @@ Dan komen de stemmen automatisch binnen en kan iedereen de uitslag live volgen. 
    {
      "rules": {
        "sessions": {
-         "$id": { ".read": true, ".write": true }
+         "$id": {
+           ".read": true,
+           "meta": {
+             ".write": "!data.exists()",
+             ".validate": "newData.hasChildren(['i', 'f', 't'])"
+           },
+           "votes": {
+             "$k": {
+               ".write": true,
+               ".validate": "$k.length <= 60 && newData.hasChildren(['name', 'v']) && newData.child('name').isString() && newData.child('name').val().length <= 40 && newData.child('v').isString() && newData.child('v').val().length <= 100 && newData.child('v').val().matches(/^[012]+$/)"
+             }
+           }
+         }
        }
      }
    }
    ```
+   Zo kan een sessie na het aanmaken niet meer gewijzigd worden, kan niemand de lijst met alle sessies opvragen en worden enkel geldige stemmen aanvaard.
 4. Kopieer de database-URL (bv. `https://mijn-filmavond-default-rtdb.europe-west1.firebasedatabase.app`) en zet ze in `config.js`:
    ```js
    firebaseUrl: 'https://mijn-filmavond-default-rtdb.europe-west1.firebasedatabase.app',
    ```
 5. Commit & push – klaar.
 
-> Iedereen met een sessielink kan in die sessie stemmen; zet er dus geen gevoelige info in.
+> De database-URL staat in `config.js` en is dus publiek: iedereen met een sessielink kan in die sessie stemmen of stemmen verwijderen. Zet er geen gevoelige info in.
 
 ## Films & posters
 - Een lijst van ±190 bekende films per genre staat in `movies.js` – voeg gerust je eigen favorieten toe (`[IMDb-id zonder "tt", titel, jaar, "genres"]`).
